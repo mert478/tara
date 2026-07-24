@@ -63,27 +63,34 @@ Write-Host "[*] Config yüklendi. ($($trustedProcs.Count) güvenilir süreç, $(
 # 1) YARDIMCI FONKSİYONLAR
 # ---------------------------------------------------------------------
 
-function Get-IPInfoCached {
-    param([string]$ip, [hashtable]$cache)
-    if ($cache.ContainsKey($ip)) { return $cache[$ip] }
+function Resolve-IPBatch {
+    # ip-api.com batch endpoint: tek istekte en fazla 100 IP sorgulanır (rate limit dostu).
+    param([string[]]$ips, [hashtable]$cache)
 
-    $result = "Sorgulanamadı"
-    if ($geoEnabled) {
+    $toQuery = $ips | Where-Object { -not $cache.ContainsKey($_) } | Select-Object -Unique
+    if (-not $toQuery -or $toQuery.Count -eq 0) { return }
+    if (-not $geoEnabled) {
+        foreach ($ip in $toQuery) { $cache[$ip] = "GeoIP Kapalı" }
+        return
+    }
+
+    # Batch endpoint 100 IP ile sınırlı, gerekirse parçalara böl
+    for ($i = 0; $i -lt $toQuery.Count; $i += 100) {
+        $chunk = $toQuery[$i..([Math]::Min($i + 99, $toQuery.Count - 1))]
+        $body = ($chunk | ForEach-Object { @{ query = $_; fields = "status,country,isp,query" } }) | ConvertTo-Json
         try {
-            $r = Invoke-RestMethod -Uri "http://ip-api.com/json/$ip?fields=status,country,isp,query" -TimeoutSec $geoTimeout -ErrorAction Stop
-            if ($r.status -eq "success") {
-                $result = "$($r.country) / $($r.isp)"
-            } else {
-                $result = "Bilinmiyor"
+            $results = Invoke-RestMethod -Uri "http://ip-api.com/batch" -Method Post -Body $body -ContentType "application/json" -TimeoutSec ($geoTimeout * 5) -ErrorAction Stop
+            foreach ($r in $results) {
+                if ($r.status -eq "success") {
+                    $cache[$r.query] = "$($r.country) / $($r.isp)"
+                } else {
+                    $cache[$r.query] = "Bilinmiyor"
+                }
             }
         } catch {
-            $result = "Sorgulanamadı (Timeout/Hata)"
+            foreach ($ip in $chunk) { $cache[$ip] = "Sorgulanamadı (Timeout/Hata)" }
         }
-    } else {
-        $result = "GeoIP Kapalı"
     }
-    $cache[$ip] = $result
-    return $result
 }
 
 function Get-FileSignatureInfo {
@@ -103,7 +110,12 @@ function Get-FileSignatureInfo {
 
 function Test-IsPrivateIP {
     param([string]$ip)
-    return ($ip -match "^127\.|^0\.0\.0\.0$|^::1$|^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.")
+    if ([string]::IsNullOrWhiteSpace($ip)) { return $true }
+    # IPv4: loopback, unspecified, private ranges (RFC1918)
+    if ($ip -match "^127\.|^0\.0\.0\.0$|^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.") { return $true }
+    # IPv6: unspecified (::), loopback (::1), link-local (fe80::), unique local (fc00::/fd00::)
+    if ($ip -eq "::" -or $ip -eq "::1" -or $ip -match "^fe80:" -or $ip -match "^f[cd][0-9a-f]{2}:") { return $true }
+    return $false
 }
 
 # ---------------------------------------------------------------------
@@ -114,7 +126,7 @@ $connections = Get-NetTCPConnection -ErrorAction SilentlyContinue
 
 Write-Host "[*] Çalışan süreçler önbelleğe alınıyor..." -ForegroundColor Yellow
 $procTable = @{}
-Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procTable[$_.Id] = $_ }
+Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procTable[[int]$_.Id] = $_ }
 
 $sigCache = @{}
 $geoCache = @{}
@@ -122,10 +134,15 @@ $geoCache = @{}
 # ---------------------------------------------------------------------
 # 3) RİSK ANALİZ MOTORU v3
 # ---------------------------------------------------------------------
+Write-Host "[*] Dış IP'ler toplanıp GeoIP toplu sorgusu yapılıyor..." -ForegroundColor Yellow
+$externalIPsToResolve = $connections | ForEach-Object { $_.RemoteAddress } | Where-Object { -not (Test-IsPrivateIP $_) } | Select-Object -Unique
+Resolve-IPBatch -ips $externalIPsToResolve -cache $geoCache
+Write-Host "[*] $($externalIPsToResolve.Count) benzersiz dış IP sorgulandı." -ForegroundColor DarkGray
+
 Write-Host "[*] Risk analizi yürütülüyor (imza + GeoIP zenginleştirmeli)..." -ForegroundColor Yellow
 
 $report = foreach ($conn in $connections) {
-    $proc = $procTable[$conn.OwningProcess]
+    $proc = $procTable[[int]$conn.OwningProcess]
     $procName = if ($proc) { $proc.Name } else { "Bilinmiyor" }
     $procPath = if ($proc) { try { $proc.Path } catch { "-" } } else { "-" }
     if (-not $procPath) { $procPath = "-" }
@@ -141,7 +158,7 @@ $report = foreach ($conn in $connections) {
     $isSigned   = $null
 
     if ($isExternal) {
-        $geoInfo = Get-IPInfoCached -ip $remoteAddr -cache $geoCache
+        $geoInfo = if ($geoCache.ContainsKey($remoteAddr)) { $geoCache[$remoteAddr] } else { "Bilinmiyor" }
     }
 
     # İmza kontrolü (sadece dosya yolu bulunan süreçler için, cache'li)
