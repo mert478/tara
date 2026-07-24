@@ -11,8 +11,17 @@
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 
+$SilvaRawUrl = "https://raw.githubusercontent.com/mert478/tara/main/silva.ps1"
+
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    if ($PSCommandPath) {
+        # Dosyadan (.ps1 çift tıklama / doğrudan çalıştırma) başlatıldıysa eski yöntem
+        Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    } else {
+        # irm | iex ile pipe edilerek çalıştırıldıysa ($PSCommandPath boş olur)
+        $cmd = "irm '$SilvaRawUrl' | iex"
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`"" -Verb RunAs
+    }
     Exit
 }
 
