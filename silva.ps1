@@ -32,7 +32,7 @@ $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 $ErrorActionPreference = 'Continue'
 
 $SilvaRawUrl = "https://raw.githubusercontent.com/mert478/tara/main/silva.ps1"
-$SilvaVersion = "4.0"
+$SilvaVersion = "4.1"
 
 # ---------------------------------------------------------------------
 # 0) YÖNETİCİ YÜKSELTME (parametreleri koruyarak)
@@ -102,7 +102,10 @@ $isFirstRun = -not (Test-Path $ConfigPath)
 if ($isFirstRun) {
     $defaultConfig = @{
         TrustedProcs      = @("svchost","lsass","csrss","wininit","services","explorer","chrome",
-                               "firefox","msedge","discord","spotify","steam","code","powershell","cmd")
+                               "firefox","msedge","discord","spotify","steam","code","powershell","cmd",
+                               "telegram","whatsapp","slack","teams","zoom","onedrive","epicgameslauncher",
+                               "riotclientservices","eadesktop","ealocalhostsvc","eacefsubprocess","nzxt cam",
+                               "battle.net","origin","dropbox","notion")
         # İsim + beklenen dizin eşleşmesi (yol içinde geçmesi yeterli, tam eşleşme aranmaz)
         ExpectedPaths     = @{
             svchost  = "C:\Windows\System32"
@@ -118,9 +121,19 @@ if ($isFirstRun) {
             spotify  = "Spotify"
             steam    = "Steam"
             code     = "Microsoft VS Code"
+            telegram = "Telegram Desktop"
+            slack    = "slack"
+            teams    = "Teams"
+            zoom     = "Zoom"
+            onedrive = "Microsoft\OneDrive"
         }
+        # NOT: Bu liste "bilinmeyen yayıncı = tehlikeli" anlamına gelmez. Geçerli (Valid) bir Authenticode
+        # imzası zaten güçlü bir meşruiyet göstergesidir; bu liste yalnızca AppData/Temp altından çalışan
+        # imzalı uygulamaları otomatik olarak Düşük risge indirmek için kullanılır.
         TrustedPublishers = @("Microsoft Corporation","Microsoft Windows","Google LLC","Mozilla Corporation",
-                               "Discord Inc.","Spotify AB","Valve Corp.","Valve Corporation","Microsoft Windows Publisher")
+                               "Discord Inc.","Spotify AB","Valve Corp.","Valve Corporation","Microsoft Windows Publisher",
+                               "Telegram FZ-LLC","Telegram Messenger Inc.","Slack Technologies","Zoom Video Communications",
+                               "WhatsApp LLC","Electronic Arts","Riot Games","NZXT Inc.","Dropbox, Inc.","Notion Labs, Inc.")
         CriticalPorts     = @(4444,5555,6666,31337,12345,1337,2222,8081)
         SuspiciousParents = @("winword","excel","powerpnt","outlook","mshta","wscript","cscript","equation")
         SuspiciousChildren= @("powershell","pwsh","cmd","wscript","cscript","mshta","regsvr32","rundll32","certutil","bitsadmin")
@@ -340,15 +353,29 @@ function Test-TrustedPath {
 }
 
 function Test-SuspiciousCommandLine {
-    param([string]$cmdLine)
+    param([string]$cmdLine, [bool]$isTrustedSigner = $false)
     if ([string]::IsNullOrWhiteSpace($cmdLine)) { return $false }
+
+    # Chromium/Electron tabanlı uygulamalar (Discord, Spotify, Slack, NZXT CAM, Steam, tarayıcılar vb.)
+    # normalde onlarca alt-süreç (--type=utility/renderer/gpu-process/zygote/crashpad-handler) açar.
+    # Bu bayraklar tamamen standarttır ve güvenilir imzalı bir binary için gürültü üretmemelidir.
+    if ($isTrustedSigner -and $cmdLine -imatch '--type=(utility|renderer|gpu-process|zygote|crashpad-handler|broker)') {
+        return $false
+    }
+
+    # Yüksek doğrulukla kötüye kullanım gösteren, dar kapsamlı ve spesifik desenler.
+    # Bilinçli olarak "hidden", "bypass" gibi tek başına çok genel kelimeler kullanılmıyor;
+    # bunlar meşru uygulamaların komut satırlarında da sıkça rastlanan alt dizgilerdir.
     $patterns = @(
-        '-enc(odedcommand)?\s',
-        '-e\s+[A-Za-z0-9+/=]{20,}',
-        'downloadstring', 'downloadfile', 'invoke-expression', '\biex\b',
-        '-w(indowstyle)?\s+hidden', '-nop\b', 'bypass',
-        'frombase64string', 'hidden', 'mshta\s+http', 'reflection\.assembly',
-        'net\.webclient', 'certutil.*-decode', 'bitsadmin.*transfer'
+        '-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{40,}',   # -enc/-e ardından gerçek bir base64 blob
+        '-window(style)?\s+hidden',                       # açıkça gizli pencere talebi
+        '\bfrombase64string\s*\(',
+        '\b(net\.webclient)\b.*\bdownloadstring\b',
+        'iex\s*\(\s*new-object',
+        'mshta(\.exe)?\s+https?://',
+        'certutil(\.exe)?\s+.*-decode',
+        'bitsadmin(\.exe)?\s+.*\btransfer\b',
+        'rundll32(\.exe)?\s+.*javascript:'
     )
     foreach ($p in $patterns) {
         if ($cmdLine -imatch $p) { return $true }
@@ -390,16 +417,24 @@ Write-Host "[*] $($externalIPsToResolve.Count) benzersiz dış IP sorgulandı." 
 # 8) (OPSİYONEL) DERİN TARAMA - BASİT BEACON TESPİTİ
 #    Aynı dış IP'ye kısa aralıklarla tekrar bağlantı kuran süreçleri işaretler.
 # ---------------------------------------------------------------------
-$beaconCounts = @{}  # key: "PID|RemoteIP" -> görülme sayısı
+$beaconPorts = @{}  # key: "PID|RemoteIP" -> gözlemlenen FARKLI yerel port'ların kümesi
 if ($DeepScan) {
-    Write-Host "[*] Derin tarama: beacon davranışı için 3 örnekleme yapılıyor (~6 sn)..." -ForegroundColor Yellow
-    for ($sample = 1; $sample -le 3; $sample++) {
-        $snap = Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object { -not (Test-IsPrivateIP $_.RemoteAddress) }
+    # Not: Beacon (düzenli C2 check-in) tespiti "bağlantı hâlâ açık mı" sorusuna değil,
+    # "süreç aynı uzak IP'ye TEKRAR TEKRAR yeni bağlantı açıyor mu" sorusuna dayanır.
+    # Tek, uzun ömürlü bir bağlantının birkaç örneklemede de açık görünmesi (Discord/Spotify/
+    # tarayıcı vb. için tamamen normaldir) beacon DEĞİLDİR. Bu yüzden aynı (PID, uzak IP) ikilisi
+    # için FARKLI yerel port'ların görülmesini arıyoruz - bu, bağlantının kapanıp yeniden
+    # kurulduğunun (gerçek bir "check-in" döngüsünün) kanıtıdır.
+    Write-Host "[*] Derin tarama: beacon davranışı için 4 örnekleme yapılıyor (~12 sn)..." -ForegroundColor Yellow
+    for ($sample = 1; $sample -le 4; $sample++) {
+        $snap = Get-NetTCPConnection -ErrorAction SilentlyContinue |
+            Where-Object { -not (Test-IsPrivateIP $_.RemoteAddress) -and $_.OwningProcess -notin @(0,4) }
         foreach ($c in $snap) {
             $key = "$($c.OwningProcess)|$($c.RemoteAddress)"
-            if ($beaconCounts.ContainsKey($key)) { $beaconCounts[$key]++ } else { $beaconCounts[$key] = 1 }
+            if (-not $beaconPorts.ContainsKey($key)) { $beaconPorts[$key] = [System.Collections.Generic.HashSet[int]]::new() }
+            [void]$beaconPorts[$key].Add([int]$c.LocalPort)
         }
-        if ($sample -lt 3) { Start-Sleep -Seconds 3 }
+        if ($sample -lt 4) { Start-Sleep -Seconds 4 }
     }
 }
 
@@ -408,8 +443,11 @@ if ($DeepScan) {
 # ---------------------------------------------------------------------
 Write-Host "[*] Risk analizi yürütülüyor (imza + yol + komut satırı + GeoIP zenginleştirmeli)..." -ForegroundColor Yellow
 
+$selfPid = $PID   # Silva'nın kendi PowerShell süreci - kendi "irm | iex" komutu yanlışlıkla şüpheli sayılmasın
+
 $report = foreach ($conn in $connections) {
     $pid_ = [int]$conn.OwningProcess
+    if ($pid_ -eq $selfPid) { continue }   # Silva kendi bağlantısını/komut satırını analiz etmez
     $proc = $procTable[$pid_]
     $procName = if ($proc) { $proc.Name } else { "Bilinmiyor" }
     $procPath = if ($proc) { try { $proc.Path } catch { "-" } } else { "-" }
@@ -446,9 +484,11 @@ $report = foreach ($conn in $connections) {
     }
 
     $pathTrust = Test-TrustedPath -procName $procName -procPath $procPath   # $true / $false / $null
-    $cmdSuspicious = Test-SuspiciousCommandLine -cmdLine $cmdLine
+    $cmdSuspicious = Test-SuspiciousCommandLine -cmdLine $cmdLine -isTrustedSigner $isTrustedPub
     $beaconKey = "$pid_|$remoteAddr"
-    $isBeacon = $DeepScan -and $beaconCounts.ContainsKey($beaconKey) -and $beaconCounts[$beaconKey] -ge 3
+    # En az 2 FARKLI yerel port ile aynı uzak IP'ye bağlanıldıysa gerçek bir yeniden-bağlanma
+    # (reconnect) döngüsü var demektir - tek bir açık bağlantı asla bunu tetiklemez.
+    $isBeacon = $DeepScan -and $beaconPorts.ContainsKey($beaconKey) -and $beaconPorts[$beaconKey].Count -ge 2
 
     # --- Karar ağacı (öncelik sırasına göre en kritikten en düşüğe) ---
     if (-not $proc) {
@@ -473,8 +513,17 @@ $report = foreach ($conn in $connections) {
         $riskStatus = "Şüpheli komut satırı deseni tespit edildi"; $riskLevel = "YÜKSEK"
     }
     elseif ($procPath -ne "-" -and $procPath -match "AppData|Temp|Public|Users\\Public|ProgramData") {
-        $pubNote = if ($isTrustedPub) { " (güvenilir yayıncı: $signerInfo)" } else { "" }
-        $riskStatus = "ŞÜPHELİ DİZİN: imzalı ama Temp/AppData altından çalışıyor$pubNote"; $riskLevel = "YÜKSEK"
+        # Not: Discord, Spotify, Telegram, Slack gibi pek çok meşru uygulama BİLEREK AppData altına
+        # kurulur (yönetici yetkisi gerektirmemek için). Geçerli bir dijital imza varsa bu durum
+        # tek başına Yüksek risk sayılmaz; sadece incelemeye değer (Orta) olarak işaretlenir.
+        # Yayıncı ayrıca TrustedPublishers listesindeyse doğrudan Düşük'e iner.
+        if ($isTrustedPub) {
+            $riskStatus = "AppData/Temp altından çalışıyor ama güvenilir yayıncı tarafından imzalı: $signerInfo"
+            $riskLevel = "Düşük"
+        } else {
+            $riskStatus = "İncelemeye değer: imzalı ama Temp/AppData altından çalışıyor (yayıncı: $signerInfo)"
+            $riskLevel = "Orta"
+        }
     }
     elseif ($isSigned -eq $false -and $isExternal) {
         $riskStatus = "İMZASIZ program dış ağla konuşuyor"; $riskLevel = "YÜKSEK"
