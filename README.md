@@ -1,4 +1,11 @@
-# 🛡 Silva v4.0 — Akıllı Ağ Güvenliği ve Risk Analiz Aracı (Tamamen Ücretsiz)
+# 🛡 Silva v4.1 — Akıllı Ağ Güvenliği ve Risk Analiz Aracı (Tamamen Ücretsiz)
+
+> **v4.1 notu:** Gerçek bir kullanıcı taramasında (225 bağlantı) yaşanan yüksek yanlış-pozitif oranı
+> düzeltildi: beacon tespiti artık gerçek yeniden-bağlanma kanıtı arıyor (tek açık bağlantıyı değil),
+> komut satırı deseni tespiti daraltıldı (Electron/Chromium alt-süreçleri artık gürültü üretmiyor),
+> script kendi başlatma komutunu artık analiz etmiyor, ve imzalı-ama-AppData'dan-çalışan yaygın
+> uygulamalar (Telegram, Discord, Spotify vb.) artık otomatik Düşük/Orta seviyeye düşüyor. Detaylar
+> için aşağıdaki "Risk Sınıflandırma Mantığı" bölümüne bakın.
 
 **Silva**, Windows sistemlerde aktif ağ bağlantılarını, bu bağlantılara sahip süreçleri, servisleri ve
 sistem kalıcılık (persistence) noktalarını tarayarak potansiyel güvenlik risklerini tespit eden,
@@ -162,10 +169,16 @@ powershell.exe -ExecutionPolicy Bypass -File .\silva.ps1 -UninstallScheduledTask
 
 | Seviye | Tetiklenme Koşulu |
 |---|---|
-| 🔴 **Kritik** | Bilinen kötü amaçlı port · Sistem/uygulama sürecini taklit eden dosya (isim+yol uyuşmazlığı) · Office/Script enjeksiyon zinciri · Dış bağlantı + şüpheli komut satırı · İmzasız + Temp/AppData'dan çalışan süreç |
-| 🟠 **Yüksek** | Şüpheli komut satırı deseni · İmzalı ama şüpheli dizinden çalışan süreç · İmzasız süreç dış ağa bağlanıyor · Olası beacon davranışı (Derin Tarama) |
-| 🟡 **Orta** | Sahipsiz/kapanmış sürece ait bağlantı · Whitelist dışı program dış ağla konuşuyor |
-| 🟢 **Düşük** | Bilinen/güvenilir süreç, normal davranış |
+| 🔴 **Kritik** | Bilinen kötü amaçlı port · Sistem/uygulama sürecini taklit eden dosya (isim+yol uyuşmazlığı) · Office/Script enjeksiyon zinciri · Dış bağlantı + gerçekten şüpheli komut satırı (base64 blob, gizli pencere, indirme zinciri vb.) · İmzasız + Temp/AppData'dan çalışan süreç |
+| 🟠 **Yüksek** | Şüpheli komut satırı deseni (iç bağlantıda) · İmzasız süreç dış ağa bağlanıyor · Gerçek yeniden-bağlanma kanıtlı olası beacon davranışı (Derin Tarama, farklı yerel port ile aynı IP'ye tekrar bağlanma) |
+| 🟡 **Orta** | Sahipsiz/kapanmış sürece ait bağlantı · Whitelist dışı program dış ağla konuşuyor · İmzalı ama tanınmayan yayıncıya ait, Temp/AppData altından çalışan süreç (ör. az bilinen bir uygulama) |
+| 🟢 **Düşük** | Bilinen/güvenilir süreç, normal davranış · İmzalı ve güvenilir yayıncıya ait, AppData altından çalışan yaygın uygulamalar (Discord, Spotify, Telegram vb. — bu, tasarım gereğidir, güvenlik açığı değildir) |
+
+**Beacon tespiti nasıl çalışır (v4.1):** Eskiden "aynı bağlantı 3 kez görüldü" beacon sayılıyordu — bu
+yanlıştı, çünkü herhangi bir uzun ömürlü normal bağlantı (Discord sesli sohbet, Spotify akışı, tarayıcı
+sekmesi) da birkaç saniyede birkaç kez "açık" görünür. Artık algoritma, aynı süreç + aynı uzak IP için
+**farklı yerel portlarla tekrar bağlantı kurulduğunu** (yani bağlantının kapanıp yeniden açıldığını) arıyor
+— bu, gerçek bir periyodik "check-in" döngüsünün daha güvenilir bir göstergesidir.
 
 ---
 
